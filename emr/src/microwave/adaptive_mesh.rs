@@ -77,7 +77,7 @@ fn compute_field_or_curl(
     curl: bool,
 ) -> Array2<c64> {
     let n = coords.shape()[1];
-    let coeff = coeff_matrix(vertices, false);
+    let coeff = coeff_matrix(vertices, true);
     let (typearray, indexarray) = parse_dofcode(dofcodes);
     let mut out = Array2::<c64>::zeros((3, n));
     let mut f = Array2::<c64>::zeros((3, n));
@@ -132,7 +132,7 @@ pub fn compute_curl_curl(
     um: &CM3,
     dofcodes: &[i64],
 ) -> C3 {
-    let coeff = coeff_matrix(vertices, false);
+    let coeff = coeff_matrix(vertices, true);
     let dummy_coords = Array2::<f64>::zeros((3, 1));
     let (typearray, indexarray) = parse_dofcode(dofcodes);
     let mut out = [c64::new(0.0, 0.0); 3];

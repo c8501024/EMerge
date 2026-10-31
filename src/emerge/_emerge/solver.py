@@ -646,14 +646,26 @@ class Solver:
         """
         return self.__class__(self.pre)
 
-    def set_options(self, pivoting_threshold: float | None = None) -> None:
+    def set_options(self, pivoting_threshold: float | None = None) -> Solver:
         """Write generic simulation options to the solver object.
         Options may be ignored depending on the type of solver used.
 
         Args:
             pivoting_threshold (float | None, optional): The pivoting threshold of direct solvers. Defaults to None.
         """
-        pass
+        return self
+
+    # [Written by Claude]
+    def set_nthreads(self, nthreads: int | None) -> Solver:
+        """Install the preferred number of CPU threads for the next solves.
+        Solvers without a thread count implementation ignore it.
+
+        Args:
+            nthreads (int | None): The number of threads. None leaves the choice to the solver backend.
+        """
+        if nthreads is not None:
+            logger.trace(f"{self.pre}{self} has no solve thread count implementation, ignoring nthreads={nthreads}.")
+        return self
 
     def solve(
         self,
@@ -1084,9 +1096,10 @@ class SolverSuperLU(Solver):
         new_solver._pivoting_threshold = self._pivoting_threshold
         return new_solver
 
-    def set_options(self, pivoting_threshold: float | None = None) -> None:
+    def set_options(self, pivoting_threshold: float | None = None) -> SolverSuperLU:
         if pivoting_threshold is not None:
             self._pivoting_threshold = pivoting_threshold
+        return self
 
     def _metis(self, A: csc_matrix, hash_value: bytes, idf: int) -> None:
         """Executes METIS column preordering algorithm from Scikit-Sparse
@@ -1198,12 +1211,13 @@ class SolverUMFPACK(Solver):
         logger.trace(self.pre + "Resetting UMFPACK solver state")
         self.fact_symb = False
 
-    def set_options(self, pivoting_threshold: float | None = None) -> None:
+    def set_options(self, pivoting_threshold: float | None = None) -> SolverUMFPACK:
         self.initialize()
         if pivoting_threshold is not None:
             self.umfpack.control[um.UMFPACK_PIVOT_TOLERANCE] = pivoting_threshold  # ty: ignore
             self.umfpack.control[um.UMFPACK_SYM_PIVOT_TOLERANCE] = pivoting_threshold  # ty: ignore
             self._pivoting_threshold = pivoting_threshold
+        return self
 
     def duplicate(self) -> Solver:
         new_solver = self.__class__(self.pre)
@@ -1303,8 +1317,9 @@ class SolverSparta(Solver):
         self.sym = None
         self.initalized = False
         self.mode: Literal['CPU','GPU','HYBRID'] = 'GPU'
+        self.nthreads: int | None = None
         self.settings: dict = dict(
-            ordering=sparta.Ordering.SCALPEL, 
+            ordering=sparta.Ordering.SCALPEL,
             refinement_steps=0,
         )
 
@@ -1324,20 +1339,39 @@ class SolverSparta(Solver):
             self.sym = None
         self.fact_symb = False
 
-    def set_options(self, mode: Literal['GPU','CPU','HYBRID']) -> None:
+    def set_options(self, mode: Literal['GPU','CPU','HYBRID']) -> SolverSparta:
         """Set the factorization mode for the factorization. Options are:
          - 'GPU': Use the GPU only
          - 'CPU': Use the CPU only
          - 'HYBRID': Use a Hybrid GPU + CPU solver (if available)
         """
-        self.mode = mode
+        self.mode = mode.strip().upper()
+        return self
+    
+    # [Written by Claude]
+    def set_nthreads(self, nthreads: int | None) -> SolverSparta:
+        """Install the number of CPU threads SPARTA uses for its analysis, CPU factorization, solves and the
+        hybrid's CPU share. None leaves it to SPARTA (the process-wide pool sized by RAYON_NUM_THREADS).
 
+        SPARTA sizes its thread pool in analyze(), so a different count discards the current analysis.
+
+        Args:
+            nthreads (int | None): The number of threads.
+        """
+        if Version(sparta.__version__) < Version("0.3.0"):
+            return super().set_nthreads(nthreads)
+        if nthreads != self.nthreads and self.sym is not None:
+            logger.trace(f"{self.pre}SPARTA thread count changed to {nthreads}, analyzing again.")
+            self.reset()
+        self.nthreads = nthreads
+        return self
+    
     def set_symmetry(self, complex_symmetric: bool) -> None:
         self._csym = complex_symmetric
 
     def duplicate(self) -> Solver:
-        new_solver = self.__class__(self.pre)
-        return new_solver
+        # [Written by Claude] Worker copies keep the mode and thread count
+        return self.__class__(self.pre).set_options(self.mode).set_nthreads(self.nthreads)
 
     def solve(self, A: csc_matrix, b: np.ndarray, precon, id: int = -1) -> tuple[np.ndarray, SolveReport]:
 
@@ -1357,7 +1391,9 @@ class SolverSparta(Solver):
             mtype = sparta.MatrixType.COMPLEX_SYMMETRIC
             
         if self.sym is None:
-            self.sym = sparta.analyze(A, force_cpu=cpu, hybrid=hybrid, mtype=mtype, **self.settings)
+            # threads is an analysis setting only; factorize() does not accept it
+            threads = {} if self.nthreads is None else dict(threads=self.nthreads)
+            self.sym = sparta.analyze(A, force_cpu=cpu, hybrid=hybrid, mtype=mtype, **threads, **self.settings)
         
         self.factor = self.sym.factorize(A, force_cpu=cpu, hybrid=hybrid, mtype=mtype, **self.settings)
         if not self.factor.quality.usable:
@@ -1395,6 +1431,7 @@ class SolverCorvid(Solver):
         self.restart: int = 100
         self._topology = None
         self._topology_key: tuple | None = None
+        self._k0: float | None = None
 
     def set_options(
         self,
@@ -1402,7 +1439,7 @@ class SolverCorvid(Solver):
         rtol: float | None = None,
         maxiter: int | None = None,
         restart: int | None = None,
-    ) -> None:
+    ) -> SolverCorvid:
         """Set the CORVID solver options. Options that are None are left unchanged.
 
         Args:
@@ -1419,18 +1456,24 @@ class SolverCorvid(Solver):
             self.maxiter = maxiter
         if restart is not None:
             self.restart = restart
+        return self
 
     def set_symmetry(self, complex_symmetric: bool) -> None:
         # COCG stores no Krylov basis but requires a complex symmetric matrix
         self.method = "cocg" if complex_symmetric else "gmres"
 
-    def set_precon_data(self, precon_dataset: PreconData, solve_ids: np.ndarray) -> None:
+    def set_precon_data(self, precon_dataset: PreconData, solve_ids: np.ndarray, k0: float | None = None) -> None:
         """Build (or reuse) the CORVID topology of the solved DoFs.
+
+        With the node coordinates and k0, CORVID also solves the unknowns next to coarsely meshed metal walls
+        exactly (its wall rule), which strongly reduces the iterations on coarse meshes.
 
         Args:
             precon_dataset (PreconData): The mesh topology per global DoF
             solve_ids (np.ndarray): The solved global DoFs, in the row order of the solved system
+            k0 (float | None, optional): The free space wave number of this solve. Defaults to None.
         """
+        self._k0 = k0
         key = (id(precon_dataset.dof_entity), solve_ids.shape[0], hash(solve_ids.tobytes()))
         if key == self._topology_key:
             return
@@ -1440,12 +1483,15 @@ class SolverCorvid(Solver):
             precon_dataset.dof_kind[solve_ids],
             precon_dataset.edges,
             precon_dataset.tris,
+            wall_vertices=precon_dataset.wall_vertices(solve_ids),
+            coords=precon_dataset.nodes,
         )
         self._topology_key = key
 
     def reset(self) -> None:
         self._topology = None
         self._topology_key = None
+        self._k0 = None
 
     def duplicate(self) -> Solver:
         new_solver = self.__class__(self.pre)
@@ -1463,15 +1509,23 @@ class SolverCorvid(Solver):
             rtol=self.rtol,
             maxiter=self.maxiter,
             restart=self.restart,
-        ).factorize(A)
+        ).factorize(A, k0=self._k0)
         x = sol.solve(b)
         iterations = [info["iterations"] for info in sol.info]
+        residuals = [info["residual"] for info in sol.info]
         converged = all(info["converged"] for info in sol.info)
-        logger.info(f"{_pfx(self.pre, id)} CORVID {self.method}: iterations {iterations}")
+        logger.info(
+            f"{_pfx(self.pre, id)} CORVID {self.method}: iterations {iterations} ({sol.n_exact} extra exact rows)"
+        )
         return x, SolveReport(
             solver=str(self),
             exit_code=0 if converged else 1,
-            aux={"iterations": iterations, "memory_bytes": sol.memory_bytes},
+            aux={
+                "iterations": iterations,
+                "residuals": residuals,
+                "n_exact": sol.n_exact,
+                "memory_bytes": sol.memory_bytes,
+            },
         )
 
 
@@ -1646,38 +1700,91 @@ class SolverPardiso(Solver):
         self.fact_symb: bool = False
         self.A: np.ndarray = None
         self.b: np.ndarray = None
+        self.nthreads: int | None = None
 
     def initialize(self) -> None:
         if self.initialized:
             return
-        self.solver = PardisoInterface()
+        self.solver = PardisoInterface(nthreads=self.nthreads)
         self.initialized = True
+
+    # [Written by Claude]
+    def duplicate(self) -> Solver:
+        # Worker copies keep the thread count
+        return self.__class__(self.pre).set_nthreads(self.nthreads)
+
+    # [Written by Claude]
+    def set_nthreads(self, nthreads: int | None) -> SolverPardiso:
+        """Install the number of CPU threads PARDISO uses. None returns the choice to MKL (MKL_NUM_THREADS).
+
+        Args:
+            nthreads (int | None): The number of threads.
+        """
+        self.nthreads = nthreads
+        if self.solver is not None:
+            self.solver.set_threads(nthreads)
+        return self
 
     def reset(self) -> None:
         self.A = None
         self.B = None
         if self.solver is not None:
             self.solver.clear_memory()
+        # Clearing PARDISO drops the symbolic factorization too.
+        self.fact_symb = False
+
+    def _check(self, error: int, id: int, phase: str) -> None:
+        """Raises a SimulationError when a PARDISO phase reported an error.
+
+        Args:
+            error (int): The PARDISO error code, 0 on success
+            id (int): The job id used in log prefixes
+            phase (str): Name of the phase, for the message
+        """
+        if error != 0:
+            try:
+                reason = self.solver.get_error(error)
+            except KeyError:
+                reason = "Unknown error."
+            logger.error(f"{_pfx(self.pre, id)} PARDISO {phase} failed with error code {error}: {reason}")
+            raise SimulationError(
+                f"{_pfx(self.pre, id)} PARDISO {phase} terminated with error code {error}"
+            )
 
     def solve(
         self, A: csc_matrix, b, precon, id: int = -1
     ) -> tuple[np.ndarray, SolveReport]:
+        import time
 
         logger.info(f"{_pfx(self.pre, id)} Calling Pardiso Solver")
+        t_symb = 0.0
         if self.fact_symb is False:
             logger.trace(f"{_pfx(self.pre, id)} Executing symbollic factorization.")
-            self.solver.symbolic(A)
+            t0 = time.perf_counter()
+            self._check(self.solver.symbolic(A), id, "symbolic factorization")
+            t_symb = time.perf_counter() - t0
             self.fact_symb = True
 
         logger.trace(f"{_pfx(self.pre, id)} Executing numeric factorization.")
-        self.solver.numeric(A)
+        t0 = time.perf_counter()
+        self._check(self.solver.numeric(A), id, "numeric factorization")
+        t_num = time.perf_counter() - t0
         self.A = A
 
         logger.trace(f"{_pfx(self.pre, id)} Solving linear system.")
+        t0 = time.perf_counter()
         x = np.zeros_like(b)
+        error = 0
         for i in range(x.shape[1]):
             logger.trace(f"{_pfx(self.pre, id)} Solving RHS {i}")
             x[:, i], error = self.solver.solve(A, b[:, i])
+            if error != 0:
+                break
+        t_solve = time.perf_counter() - t0
+        logger.info(
+            f"{_pfx(self.pre, id)} PARDISO {'LDLT (symmetric)' if self.solver.symmetric else 'LU'}: "
+            f"symbolic {t_symb:.3f}s, numeric {t_num:.3f}s, solve {t_solve:.3f}s"
+        )
 
         if error != 0:
             logger.error(f"{_pfx(self.pre, id)} Terminated with error code {error}")
@@ -2474,6 +2581,7 @@ class SolveRoutine:
         bsel: np.ndarray,
         matrix_type: MatrixType,
         id: int = -1,
+        nthreads: int | None = None,
     ) -> tuple[np.ndarray, SolveReport, str, str, csc_matrix]:
         """Solve the reduced system with one solver, including its real conversion, sorting and preconditioner.
 
@@ -2483,6 +2591,7 @@ class SolveRoutine:
             bsel (np.ndarray): The right hand side(s) on the solved DoFs
             matrix_type (MatrixType): The matrix type
             id (int, optional): An identifier of this solve used in log messages. Defaults to -1.
+            nthreads (int | None, optional): The preferred number of CPU threads of the solver. Defaults to None.
 
         Returns:
             tuple[np.ndarray, SolveReport, str, str, csc_matrix]: The solution on the solved DoFs, the solver report,
@@ -2490,6 +2599,9 @@ class SolveRoutine:
         """
         solver.initialize()
         solver.set_symmetry(matrix_type.symmetric or self.force_symmetric)
+        # None keeps what the solver has, e.g. a count set with solver.set_nthreads()
+        if nthreads is not None:
+            solver.set_nthreads(nthreads)
 
         if solver.real_only:
             logger.debug(f"{_pfx(self.pre, id)} Converting to real matrix")
@@ -2532,6 +2644,8 @@ class SolveRoutine:
         id: int = -1,
         matrix_type: MatrixType = MatrixType.UNKNOWN,
         precon_dataset: PreconData | None = None,
+        k0: float | None = None,
+        nthreads: int | None = None,
     ) -> tuple[np.ndarray, SolveReport]:
         """Solve the system of equations defined by Ax=b for x.
 
@@ -2548,6 +2662,9 @@ class SolveRoutine:
             matrix_type (MatrixType, optional): The matrix type. Classified from A if UNKNOWN. Defaults to MatrixType.UNKNOWN.
             precon_dataset (PreconData | None, optional): The mesh topology needed by preconditioned iterative
                 solvers such as CORVID. Defaults to None.
+            k0 (float | None, optional): The free space wave number of this system, used by CORVID. Defaults to None.
+            nthreads (int | None, optional): The preferred number of CPU threads, passed to the solver's
+                set_nthreads(). None keeps the solver's own setting. Defaults to None.
 
         Returns:
             tuple[np.ndarray, SolveReport]: The solution and the solve report.
@@ -2591,17 +2708,17 @@ class SolveRoutine:
                 )
                 solver = self.pick_solver(A, b, matrix_type, direct=True)
             else:
-                solver.set_precon_data(precon_dataset, solve_ids)
+                solver.set_precon_data(precon_dataset, solve_ids, k0=k0)
 
         start = time.time()
-        x, report, sorter, precon, Asorted = self._solve_with(solver, Asel, bsel, matrix_type, id)
+        x, report, sorter, precon, Asorted = self._solve_with(solver, Asel, bsel, matrix_type, id, nthreads)
 
         if report.exit_code != 0 and solver.needs_precon_data:
             logger.warning(
                 f"{_pfx(self.pre, id)} {solver} did not converge. Solving again with a direct solver."
             )
             solver = self.pick_solver(A, b, matrix_type, direct=True)
-            x, report, sorter, precon, Asorted = self._solve_with(solver, Asel, bsel, matrix_type, id)
+            x, report, sorter, precon, Asorted = self._solve_with(solver, Asel, bsel, matrix_type, id, nthreads)
 
         end = time.time()
         simtime = end - start
@@ -2796,6 +2913,8 @@ class AutomaticRoutine(SolveRoutine):
                 return self._try_solver(EMSolver.CHOLMOD)
             if _PARDISO_AVAILABLE:
                 return self._try_solver(EMSolver.PARDISO)
+            elif _SPARTA_AVAILABLE:
+                return self._try_solver(EMSolver.SPARTA)
             elif _AASDS_AVAILABLE:
                 return self._try_solver(EMSolver.AASDS)
             elif _RSLAB_AVAILABLE:
@@ -2807,7 +2926,9 @@ class AutomaticRoutine(SolveRoutine):
             else:
                 return self._try_solver(EMSolver.SUPERLU)
         elif self.parallel == "MP":
-            if _AASDS_AVAILABLE:
+            if _SPARTA_AVAILABLE:
+                return self._try_solver(EMSolver.SPARTA)
+            elif _AASDS_AVAILABLE:
                 return self._try_solver(EMSolver.AASDS)
             elif _RSLAB_AVAILABLE:
                 return self._try_solver(EMSolver.RSLAB)

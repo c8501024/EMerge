@@ -115,7 +115,7 @@ abc = model.mw.bc.AbsorbingBoundary(boundary_selection)
 model.view(plot_mesh=True, volume_mesh=False)
 model.view(bc=True)
 
-data = model.mw.run_sweep()
+data = model.mw.run_sweep(nthreads=8)
 
 # --- Post-process S-parameters ------------------------------------------
 freqs = data.scalar.grid.freq

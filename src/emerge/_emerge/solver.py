@@ -1337,6 +1337,10 @@ class SolverSparta(Solver):
 
     def duplicate(self) -> Solver:
         new_solver = self.__class__(self.pre)
+        # [Written by Claude] keep the settings (CPU/GPU mode, symmetry, SPARTA options) in the copy
+        new_solver.mode = self.mode
+        new_solver._csym = self._csym
+        new_solver.settings = dict(self.settings)
         return new_solver
 
     def solve(self, A: csc_matrix, b: np.ndarray, precon, id: int = -1) -> tuple[np.ndarray, SolveReport]:

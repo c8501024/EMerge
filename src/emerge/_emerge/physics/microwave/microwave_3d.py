@@ -51,6 +51,7 @@ from loguru import logger
 from typing import Callable, Literal, Any
 from contextlib import nullcontext
 import multiprocessing as mp
+import pickle
 from cmath import sqrt as csqrt
 from itertools import product
 import numpy as np
@@ -130,6 +131,58 @@ def _solve_krylov(
 _worker_routine: SolveRoutine | None = None
 
 
+_worker_choice: dict | None = None
+
+
+# [Written by Claude]
+def _solver_choice(routine: SolveRoutine) -> dict | None:
+    """The solver choice of the main process, in a form that can be sent to the worker processes.
+
+    The worker processes build their own SolveRoutine (`run_job_multi`). Without this, a solver chosen
+    with `set_solver()` (and its settings, e.g. SPARTA's CPU/GPU mode) is not used there: the workers
+    fall back on the automatic choice. Returns None if the choice cannot be pickled; the workers then
+    keep the automatic choice, as before.
+    """
+    choice = dict(
+        forced=[solver.duplicate() for solver in routine.forced_solver],
+        force_symmetric=routine.force_symmetric,
+        symmetry_limit=routine.symmetry_limit,
+    )
+    try:
+        pickle.dumps(choice)
+    except Exception as e:
+        logger.warning(
+            f"The chosen solver cannot be sent to the worker processes ({e}); they use the automatic choice."
+        )
+        return None
+    return choice
+
+
+# [Written by Claude]
+def _init_worker(choice: dict | None) -> None:
+    """Pool initializer: remembers the solver choice of the main process (see `_solver_choice`)."""
+    global _worker_choice, _worker_routine
+    _worker_choice = choice
+    _worker_routine = None
+
+
+# [Written by Claude]
+def _apply_worker_choice(routine: SolveRoutine, choice: dict | None) -> None:
+    """Puts the solver choice of the main process into a worker's SolveRoutine."""
+    if not choice:
+        return
+    routine.force_symmetric = choice["force_symmetric"]
+    routine.symmetry_limit = choice["symmetry_limit"]
+    forced = []
+    for solver in choice["forced"]:
+        solver.pre = routine.pre
+        for key, own in routine.solvers.items():
+            if type(own) is type(solver):
+                routine.solvers[key] = solver   # so that reset() and configure() reach it too
+        forced.append(solver)
+    routine.forced_solver = forced
+
+
 def run_job_multi(job: SimJob) -> SimJob:
     """The job launcher for Multi-Processing environements
 
@@ -148,6 +201,7 @@ def run_job_multi(job: SimJob) -> SimJob:
     if _worker_routine is None:
         nr = int(mp.current_process().name.split("-")[1])
         _worker_routine = AutomaticRoutine()._configure_routine("MP", proc_nr=nr)
+        _apply_worker_choice(_worker_routine, _worker_choice)
     A, bmat, ids, aux = job.get_Ab()
     solution, report = _worker_routine.solve(
         A, bmat, ids, matrix_type=job.mtype, id=job.id, precon_dataset=job._precon
@@ -1227,7 +1281,14 @@ class Microwave3D(GenericPhysics3D):
                 "Multiprocess support must be launched from your "
                 "if __name__ == '__main__' guard in the top-level script."
             )
-        return mp.Pool(processes=n_workers)
+        # [Written by Claude] "spawn" on every platform: a forked worker (the Linux default) inherits the
+        # Rust/rayon thread pools of the main process without their threads and hangs in its first
+        # parallel kernel (e.g. csc_submatrix). Windows and macOS spawn anyway.
+        return mp.get_context("spawn").Pool(
+            processes=n_workers,
+            initializer=_init_worker,
+            initargs=(_solver_choice(self.solveroutine),),
+        )
 
     def _run_frequency_domain(
         self,

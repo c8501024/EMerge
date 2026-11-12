@@ -726,8 +726,27 @@ class ModalPort(PortBC, Saveable):
         return beta
 
     def get_gamma(self, k0: float) -> complex:
-        return 1j * self.get_beta(k0)
+        # [Written by Claude] The Robin coefficient of the first mode times 1/μr of the port face: jβ for TE and TEM
+        # modes, j k²/β for TM modes (e.g. a waveguide with PMC walls). It used to be jβ for every mode and without
+        # 1/μr, which reflected TM modes and every mode of a port in magnetic material.
+        # γ = jβ + c with c = ∫∇e_z·e_t dS / ∫e_t·e_t dS = -j kc²/β for a TM mode. A mode taken from another
+        # frequency (below cutoff, see Microwave3D._scale_port_modes) keeps its kc², so c scales with 1/β.
+        mode = self.get_modes(k0)[0]
+        beta = self.get_beta(k0)
+        gamma = 1j * beta + (mode.robin_gamma() - 1j * mode.beta) * mode.beta / beta
+        return gamma * mode.urinv_t()
 
+    # [Written by Claude]
+    def get_Uinc(
+        self,
+        x_global: np.ndarray,
+        y_global: np.ndarray,
+        z_global: np.ndarray,
+        k0: float,
+        mode_nr: int = 1,
+    ) -> np.ndarray:
+        """The incident field excitation term -2γ e of the port (see get_gamma) at global coordinates."""
+        return -2 * self.get_gamma(k0) * self.port_mode_3d_global(x_global, y_global, z_global, k0, mode_nr=mode_nr)
 
     def port_mode_3d(
         self,
@@ -865,7 +884,8 @@ class WavePortIH(ModalPort, Saveable):
         Returns:
             np.ndarray: The (3, N) excitation field
         """
-        return -2 * self.port_mode_3d_global(
+        # [Written by Claude] times 1/μr of the port face, like the matrix term (get_modepf_kappa)
+        return -2 * self.get_modes(k0)[0].urinv_t() * self.port_mode_3d_global(
             x_global, y_global, z_global, k0, which="modprof", mode_nr=mode_nr
         )
 
@@ -883,9 +903,11 @@ class WavePortIH(ModalPort, Saveable):
             tuple[Callable, Callable, complex]: The mode profile function, the transverse mode field function and kappa
         """
         mode = self.get_modes(k0)[0]
+        # [Written by Claude] The port term is (1/μr) n×∇×E: scale the mode profile and kappa with 1/μr
+        urinv = mode.urinv_t()
 
         def fmp(x, y, z):
-            return mode.E_function.calc_eff_modeprofile(x, y, z)
+            return urinv * mode.E_function.calc_eff_modeprofile(x, y, z)
 
         def fxy(x, y, z):
             return mode.E_function.calcExy(x, y, z)
@@ -893,7 +915,7 @@ class WavePortIH(ModalPort, Saveable):
         return (
             fmp,
             fxy,
-            mode.compute_kappa(nodes, tris),
+            urinv * mode.compute_kappa(nodes, tris),
         )
 
 
@@ -974,7 +996,13 @@ class MultiModeWavePort(WavePortIH, Saveable):
             def fmp(x, y, z, mode=mode):
                 return mode.E_function.calc_eff_modeprofile(x, y, z)
 
-            out.append((number, fmp, mode.compute_kappa(nodes, tris)))
+            # [Written by Claude] The port term is (1/μr) n×∇×E: scale the mode profile and kappa with 1/μr
+            urinv = mode.urinv_t()
+
+            def fmp_ur(x, y, z, fmp=fmp, urinv=urinv):
+                return urinv * fmp(x, y, z)
+
+            out.append((number, fmp_ur, urinv * mode.compute_kappa(nodes, tris)))
         return out
 
     # [Written by Claude]
